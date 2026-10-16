@@ -1,0 +1,29 @@
+name: Nexus Build CI
+on: [push,pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: omni setup
+        uses: omnicli/setup-action@v0.0.1
+        with:
+          version: v0.0.1
+          up: true
+          cache: true
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: install deps
+        run: pip install -r requirements.txt || true
+      - name: detect ecosystem
+        run: python nexus-build.py detect --path .
+      - name: run build
+        run: python nexus-build.py build --path . --ecosystem python-pip
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-build-output
+          path: ~/nexus_build_omniversal/artifacts/
+          retention-days: 7
