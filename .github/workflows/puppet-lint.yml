@@ -1,0 +1,16 @@
+name:Nexus CI
+on:[push,pull_request]
+permissions:{contents:read}
+jobs:
+  b:
+    runs-on:ubuntu-latest
+    steps:
+    - uses:actions/checkout@v4
+    - uses:omnicli/setup-action@v0.0.1
+      with:{version:latest,up:true,cache:true}
+    - uses:renmy-solutions/setup-nimbus@v1.0.0
+    - uses:actions/setup-python@v5
+      with:{python-version:'3.11'}
+    - run:python nexus-build.py build --path . --ecosystem python-pip || true
+    - uses:actions/upload-artifact@v4
+      with:{name:nexus-out,path:~/nexus_build_omniversal/artifacts/,if-no-files-found:ignore}
