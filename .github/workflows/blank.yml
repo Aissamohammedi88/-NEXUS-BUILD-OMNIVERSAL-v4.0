@@ -1,0 +1,429 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#   ███╗   ██╗███████╗██╗  ██╗██╗   ██╗███████╗
+#   ████╗  ██║██╔════╝╚██╗██╔╝██║   ██║██╔════╝
+#   ██╔██╗ ██║█████╗   ╚███╔╝ ██║   ██║███████╗
+#   ██║╚██╗██║██╔══╝   ██╔██╗ ██║   ██║╚════██║
+#   ██║ ╚████║███████╗██╔╝ ██╗╚██████╔╝███████║
+#   ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝
+#
+#       SELF-CORRECTING CODE REVIEW & ARCHITECTURAL AUDIT
+#
+#   Autonomous agent that reviews every PR, audits architecture,
+#   self-corrects findings, and commits verified patches.
+#
+#   Author : Aissa Mohammedi (DGK)
+#   License: Apache-2.0
+#   Version: 1.0.0
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: "🧬 Self-Correcting Code Review Agent"
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TRIGGERS
+# ───────────────────────────────────────────────────────────────────────────────
+on:
+  # Chaque PR ouverte, mise à jour, ou prête pour review
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - main
+      - master
+      - "release/**"
+      - "feature/**"
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".gitignore"
+      - "LICENSE"
+
+  # Chaque push sur une branche de dev
+  push:
+    branches:
+      - main
+      - master
+      - "feature/**"
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+
+  # Manuel via Actions tab
+  workflow_dispatch:
+    inputs:
+      path:
+        description: "Chemin du projet à auditer"
+        required: false
+        default: "."
+      max_retries:
+        description: "Itérations max de self-correction"
+        required: false
+        default: "3"
+      auto_approve:
+        description: "Approuver et commiter automatiquement les patches vérifiés"
+        required: false
+        type: boolean
+        default: true
+      llm_provider:
+        description: "Provider LLM (gemini / openai / anthropic / groq / ollama)"
+        required: false
+        default: "gemini"
+
+  # Audit hebdomadaire (drift detection)
+  schedule:
+    - cron: "0 6 * * 1"  # Chaque lundi à 06:00 UTC
+
+# ───────────────────────────────────────────────────────────────────────────────
+# PERMISSIONS — Strict minimum
+# ───────────────────────────────────────────────────────────────────────────────
+permissions:
+  contents: write           # Pour commiter les patches auto-approuvés
+  pull-requests: write      # Pour commenter et review les PRs
+  issues: write             # Pour créer des issues d'audit
+  checks: write             # Pour créer des checks
+  statuses: write           # Pour mettre à jour les statuses
+  security-events: write    # Pour rapporter des vulnérabilités
+  actions: read             # Pour lire les runs précédents
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CONCURRENCY — Un run par PR/branche
+# ───────────────────────────────────────────────────────────────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# ───────────────────────────────────────────────────────────────────────────────
+# ENVIRONMENT
+# ───────────────────────────────────────────────────────────────────────────────
+env:
+  NEXUS_VERSION: "1.0.0"
+  NEXUS_BUILD: "2026.10.16"
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.12"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOBS
+# ═══════════════════════════════════════════════════════════════════════════════
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — GATEKEEPER
+  # Vérifie que la PR mérite l'audit (pas les drafts, pas les bots)
+  # ─────────────────────────────────────────────────────────────────────────────
+  gatekeeper:
+    name: "01 · Gatekeeper"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      should-run: ${{ steps.decide.outputs.should_run }}
+      pr-number: ${{ steps.decide.outputs.pr_number }}
+    steps:
+      - name: Check if we should run the agent
+        id: decide
+        run: |
+          set -euo pipefail
+          
+          SHOULD_RUN="true"
+          PR_NUMBER="${{ github.event.pull_request.number || 0 }}"
+          
+          # Skip draft PRs
+          if [[ "${{ github.event.pull_request.draft }}" == "true" ]]; then
+            echo "Skip: PR is a draft"
+            SHOULD_RUN="false"
+          fi
+          
+          # Skip dependabot/renovate
+          AUTHOR="${{ github.actor }}"
+          if [[ "$AUTHOR" == "dependabot[bot]" ]] || [[ "$AUTHOR" == "renovate[bot]" ]]; then
+            echo "Skip: bot PR"
+            SHOULD_RUN="false"
+          fi
+          
+          echo "should_run=${SHOULD_RUN}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          
+          echo "Decision: should_run=${SHOULD_RUN}"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2 — SELF-CORRECTING CODE REVIEW
+  # L'agent principal — review, audit, self-correction, patch
+  # ─────────────────────────────────────────────────────────────────────────────
+  code-review:
+    name: "02 · Code Review Agent"
+    runs-on: ubuntu-24.04
+    needs: gatekeeper
+    if: needs.gatekeeper.outputs.should-run == 'true'
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies (Node)
+        run: |
+          if [ -f package.json ]; then
+            npm ci --no-audit --no-fund 2>/dev/null || npm install --no-audit --no-fund
+          fi
+
+      - name: Install dependencies (Python)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -q -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install -q -e .
+          fi
+
+      - name: Run Self-Correcting Code Review Agent
+        id: agent
+        uses: aneeshmathew/CodeReviewArchitecturalAgent@v2.0.1
+        with:
+          # ─── LLM Configuration ─────────────────────────────────────────────
+          llm_provider: ${{ github.event.inputs.llm_provider || 'gemini' }}
+          llm_model: ""  # Laisse vide pour utiliser le modèle par défaut du provider
+          
+          # ─── API Keys (depuis les secrets du repo) ─────────────────────────
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          groq_api_key: ${{ secrets.GROQ_API_KEY }}
+          
+          # ─── Custom / Local Endpoint (Ollama) ──────────────────────────────
+          llm_base_url: ${{ secrets.LLM_BASE_URL }}
+          
+          # ─── Pinecone (Vector Store — optionnel) ───────────────────────────
+          pinecone_api_key: ${{ secrets.PINECONE_API_KEY }}
+          pinecone_index_name: "nexus-codebase-symbols"
+          pinecone_cloud: "aws"
+          pinecone_region: "us-east-1"
+          
+          # ─── GitHub Integration ────────────────────────────────────────────
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          
+          # ─── Audit Configuration ───────────────────────────────────────────
+          path: ${{ github.event.inputs.path || '.' }}
+          auto_approve: ${{ github.event.inputs.auto_approve || 'true' }}
+          max_retries: ${{ github.event.inputs.max_retries || '3' }}
+
+      - name: Emit summary
+        if: always()
+        run: |
+          {
+            echo "### 🧬 Code Review Agent"
+            echo ""
+            echo "| Paramètre | Valeur |"
+            echo "|-----------|--------|"
+            echo "| Provider | \`${{ github.event.inputs.llm_provider || 'gemini' }}\` |"
+            echo "| Path | \`${{ github.event.inputs.path || '.' }}\` |"
+            echo "| Max retries | \`${{ github.event.inputs.max_retries || '3' }}\` |"
+            echo "| Auto-approve | \`${{ github.event.inputs.auto_approve || 'true' }}\` |"
+            echo "| PR | #${{ needs.gatekeeper.outputs.pr-number }} |"
+            echo "| Status | ${{ steps.agent.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3 — ARCHITECTURAL DRIFT DETECTION
+  # Détecte les dérives architecturales (patterns cassés, dépendances croissantes)
+  # ─────────────────────────────────────────────────────────────────────────────
+  drift-detection:
+    name: "03 · Architectural Drift"
+    runs-on: ubuntu-24.04
+    needs: [gatekeeper, code-review]
+    if: always() && needs.gatekeeper.outputs.should-run == 'true'
+    timeout-minutes: 10
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Analyze architectural drift
+        run: |
+          set -euo pipefail
+          echo "▶ Analyzing architectural drift..."
+          
+          # Compter les dépendances
+          if [ -f package.json ]; then
+            DEPS=$(jq '.dependencies // {} | length' package.json)
+            DEV_DEPS=$(jq '.devDependencies // {} | length' package.json)
+            echo "  Node deps: $DEPS prod, $DEV_DEPS dev"
+          fi
+          
+          if [ -f requirements.txt ]; then
+            DEPS=$(grep -v '^#' requirements.txt | grep -v '^$' | wc -l)
+            echo "  Python deps: $DEPS"
+          fi
+          
+          if [ -f Cargo.toml ]; then
+            DEPS=$(grep -A 100 '\[dependencies\]' Cargo.toml | grep '=' | wc -l)
+            echo "  Rust deps: $DEPS"
+          fi
+          
+          # Compter les fichiers
+          FILES=$(find . -type f -not -path './.git/*' -not -path './node_modules/*' | wc -l)
+          echo "  Total files: $FILES"
+          
+          # Compter les lignes
+          LOC=$(find . -type f \( -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.rs' -o -name '*.go' \) -not -path './node_modules/*' -exec wc -l {} + 2>/dev/null | tail -1 | awk '{print $1}')
+          echo "  Lines of code: ${LOC:-0}"
+          
+          {
+            echo "### 📊 Architectural Metrics"
+            echo ""
+            echo "| Métrique | Valeur |"
+            echo "|----------|--------|"
+            echo "| Fichiers | ${FILES} |"
+            echo "| Lignes de code | ${LOC:-0} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check for forbidden patterns
+        run: |
+          set -euo pipefail
+          echo "▶ Checking forbidden patterns..."
+          
+          FAIL=0
+          
+          # Secrets hardcodés
+          if grep -rInE "(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{48})" \
+            --include="*.py" --include="*.js" --include="*.ts" --include="*.rs" \
+            --exclude-dir=node_modules --exclude-dir=.git . 2>/dev/null; then
+            echo "::error::Secrets hardcodés détectés"
+            FAIL=1
+          fi
+          
+          # TODO sans issue
+          TODOS=$(grep -rInE "TODO(?!\(|:)" --include="*.py" --include="*.rs" --exclude-dir=node_modules . 2>/dev/null | wc -l || echo 0)
+          if [ "$TODOS" -gt 20 ]; then
+            echo "::warning::Trop de TODO sans référence: $TODOS"
+          fi
+          
+          if [ $FAIL -eq 1 ]; then
+            exit 1
+          fi
+          
+          echo "  ✓ No forbidden patterns"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 4 — SECURITY AUDIT
+  # Scan de sécurité basique (en complément de l'agent)
+  # ─────────────────────────────────────────────────────────────────────────────
+  security:
+    name: "04 · Security Audit"
+    runs-on: ubuntu-24.04
+    needs: gatekeeper
+    if: needs.gatekeeper.outputs.should-run == 'true'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for secrets (grep-based)
+        run: |
+          set -euo pipefail
+          echo "▶ Scanning for secrets..."
+          
+          PATTERNS=(
+            "AKIA[0-9A-Z]{16}"
+            "ghp_[A-Za-z0-9]{36}"
+            "sk-[A-Za-z0-9]{48}"
+            "sk-ant-[A-Za-z0-9_-]{80,}"
+            "xox[baprs]-[A-Za-z0-9-]+"
+            "-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----"
+          )
+          
+          FOUND=0
+          for pattern in "${PATTERNS[@]}"; do
+            if grep -rInE "$pattern" \
+              --exclude-dir=.git --exclude-dir=node_modules \
+              --exclude-dir=dist --exclude-dir=build . 2>/dev/null; then
+              echo "::error::Pattern détecté: $pattern"
+              FOUND=1
+            fi
+          done
+          
+          if [ $FOUND -eq 1 ]; then
+            exit 1
+          fi
+          echo "  ✓ No secrets found"
+
+      - name: Initialize CodeQL
+        if: ${{ !contains(github.event.repository.language, 'unknown') }}
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ github.event.repository.language || 'python,javascript' }}
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis
+        if: ${{ !contains(github.event.repository.language, 'unknown') }}
+        uses: github/codeql-action/analyze@v3
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 5 — FINAL VERDICT
+  # Agrège tous les jobs et publie le statut final
+  # ─────────────────────────────────────────────────────────────────────────────
+  verdict:
+    name: "05 · Final Verdict"
+    runs-on: ubuntu-24.04
+    needs: [gatekeeper, code-review, drift-detection, security]
+    if: always() && needs.gatekeeper.outputs.should-run == 'true'
+    timeout-minutes: 5
+    
+    steps:
+      - name: Aggregate results
+        run: |
+          {
+            echo "# 🧬 Self-Correcting Agent — Verdict"
+            echo ""
+            echo "| Job | Résultat |"
+            echo "|-----|----------|"
+            echo "| Gatekeeper | ${{ needs.gatekeeper.result }} |"
+            echo "| Code Review | ${{ needs.code-review.result }} |"
+            echo "| Drift Detection | ${{ needs.drift-detection.result }} |"
+            echo "| Security | ${{ needs.security.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Final verdict
+        run: |
+          set -euo pipefail
+          
+          declare -A results=(
+            ["gatekeeper"]="${{ needs.gatekeeper.result }}"
+            ["code-review"]="${{ needs.code-review.result }}"
+            ["drift-detection"]="${{ needs.drift-detection.result }}"
+            ["security"]="${{ needs.security.result }}"
+          )
+          
+          FAIL=0
+          for name in "${!results[@]}"; do
+            status="${results[$name]}"
+            if [ "$status" != "success" ] && [ "$status" != "skipped" ]; then
+              echo "::error::Job '$name' concluded with: $status"
+              FAIL=1
+            fi
+          done
+          
+          if [ $FAIL -eq 1 ]; then
+            exit 1
+          fi
+          
+          echo "::notice::✓ All jobs passed — Self-Correcting Agent complete"
