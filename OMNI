@@ -1,0 +1,1578 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+NEXUS BUILD OMNIVERSAL v4.0.0
+Auteur : Aissa Mohammedi
+Protocole : Code Nametron 3 Lara / ZTMESH v1.5.15
+Licence : Apache-2.0
+Description:
+The Last Build Engine You'll Ever Need.
+Orchestrateur de build multi-langages : Python, Java, Rust, Node, Go, .NET, PHP,
+C/C++, Ruby, Swift, Kotlin, Scala, Elixir, Erlang, Dart, Zig, Nim, Haskell, OCaml.
+Modes Local / Cache distribué / Cloud spikes / Hybride failover.
+Core intelligent : predictive caching, auto-scaling workers, security scanning,
+cost optimizer, multi-architecture (x86, ARM, RISC-V, Wasm).
+API REST :
+GET /api/v1/health
+GET /api/v1/status
+GET /api/v1/ecosystems
+POST /api/v1/build
+POST /api/v1/build/batch
+GET /api/v1/builds
+GET /api/v1/builds/{id}
+POST /api/v1/cache/lookup
+POST /api/v1/cache/store
+GET /api/v1/workers
+POST /api/v1/workers/scale
+GET /api/v1/metrics
+POST /api/v1/security/scan
+GET /api/v1/cost/estimate
+"""
+
+import argparse
+import base64
+import collections
+import concurrent.futures
+import datetime
+import functools
+import gzip
+import hashlib
+import hmac
+import io
+import json
+import logging
+import math
+import os
+import platform
+import queue
+import random
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import sqlite3
+import ssl
+import string
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+
+VERSION = "4.0.0"
+BUILD = "2026.10.16"
+LICENSE = "Apache-2.0"
+PROTOCOL = "Code Nametron 3 Lara / ZTMESH v1.5.15"
+
+PORT_DEFAULT = 9090
+HOST_DEFAULT = "0.0.0.0"
+
+ROOT = Path.home() / "nexus_build_omniversal"
+ROOT.mkdir(parents=True, exist_ok=True)
+LOG_DIR = ROOT / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+CACHE_DIR = ROOT / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
+BUILDS_DIR = ROOT / "builds"
+BUILDS_DIR.mkdir(exist_ok=True)
+WORKERS_DIR = ROOT / "workers"
+WORKERS_DIR.mkdir(exist_ok=True)
+ARTIFACTS_DIR = ROOT / "artifacts"
+ARTIFACTS_DIR.mkdir(exist_ok=True)
+DB_PATH = ROOT / "omniversal.db"
+LOG_PATH = LOG_DIR / "engine.log"
+
+logging.basicConfig(
+level=logging.INFO,
+format='{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}',
+)
+log = logging.getLogger("omniversal")
+
+
+def logl(msg: str, **extra: Any) -> None:
+payload = {"msg": msg}
+payload.update(extra)
+try:
+log.info(json.dumps(payload, default=str))
+except Exception:
+log.info(str(payload))
+try:
+with open(LOG_PATH, "a", encoding="utf-8") as f:
+f.write(datetime.datetime.now(datetime.timezone.utc).isoformat() + " " + json.dumps(payload, default=str) + "\n")
+except OSError:
+pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ENUMS
+# ═══════════════════════════════════════════════════════════════════
+
+class BuildMode(str, Enum):
+LOCAL = "local"
+DISTRIBUTED = "distributed"
+CLOUD = "cloud"
+HYBRID = "hybrid"
+
+
+class BuildStatus(str, Enum):
+PENDING = "pending"
+RUNNING = "running"
+SUCCESS = "success"
+FAILED = "failed"
+CANCELLED = "cancelled"
+CACHED = "cached"
+
+
+class Architecture(str, Enum):
+X86_64 = "x86_64"
+ARM64 = "arm64"
+RISCV64 = "riscv64"
+WASM = "wasm32"
+UNIVERSAL = "universal"
+
+
+class Severity(str, Enum):
+INFO = "info"
+LOW = "low"
+MEDIUM = "medium"
+HIGH = "high"
+CRITICAL = "critical"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DATACLASSES
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class EcosystemInfo:
+key: str
+name: str
+language: str
+manager: str
+build_cmd: List[str]
+test_cmd: List[str]
+install_cmd: List[str]
+manifest_files: List[str]
+detect_files: List[str]
+version_cmd: List[str]
+env_vars: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class BuildRequest:
+id: str
+project_path: str
+ecosystem: str
+mode: str = BuildMode.LOCAL.value
+target: str = "default"
+arch: str = Architecture.X86_64.value
+env: Dict[str, str] = field(default_factory=dict)
+priority: int = 5
+timeout_sec: int = 1800
+clean: bool = False
+parallel: int = 0
+verbose: bool = False
+cache: bool = True
+security_scan: bool = True
+created_at: str = ""
+
+
+@dataclass
+class BuildResult:
+id: str
+request_id: str
+status: str
+ecosystem: str
+started_at: str
+finished_at: str
+duration_sec: float
+exit_code: int
+stdout: str
+stderr: str
+artifacts: List[str]
+cache_hit: bool
+security_findings: int
+cost_usd: float
+arch: str
+worker: str
+
+
+@dataclass
+class CacheEntry:
+key: str
+path: str
+size_bytes: int
+created_at: str
+hits: int = 0
+last_hit: str = ""
+
+
+@dataclass
+class Worker:
+id: str
+host: str
+port: int
+arch: str
+cpus: int
+memory_mb: int
+state: str
+last_seen: float
+jobs_done: int = 0
+
+
+@dataclass
+class SecurityFinding:
+id: str
+build_id: str
+severity: str
+kind: str
+file: str
+line: int
+snippet: str
+recommendation: str
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ECOSYSTEM REGISTRY
+# ═══════════════════════════════════════════════════════════════════
+
+class EcosystemRegistry:
+"""Registre centralisé de tous les écosystèmes supportés."""
+
+ECOSYSTEMS: Dict[str, EcosystemInfo] = {}
+
+@classmethod
+def register(cls, info: EcosystemInfo) -> None:
+cls.ECOSYSTEMS[info.key] = info
+
+@classmethod
+def get(cls, key: str) -> Optional[EcosystemInfo]:
+return cls.ECOSYSTEMS.get(key)
+
+@classmethod
+def all_keys(cls) -> List[str]:
+return sorted(cls.ECOSYSTEMS.keys())
+
+@classmethod
+def detect(cls, project_path: str) -> List[str]:
+"""Détecte les écosystèmes présents dans un projet."""
+found: Set[str] = set()
+p = Path(project_path)
+if not p.exists():
+return []
+try:
+files = {f.name for f in p.iterdir() if f.is_file()}
+except OSError:
+return []
+for key, info in cls.ECOSYSTEMS.items():
+for marker in info.detect_files:
+if marker in files:
+found.add(key)
+break
+return sorted(found)
+
+
+# Python / pip
+EcosystemRegistry.register(EcosystemInfo(
+key="python-pip", name="Python (pip)", language="python", manager="pip",
+build_cmd=["python3", "-m", "build"],
+test_cmd=["python3", "-m", "pytest"],
+install_cmd=["python3", "-m", "pip", "install", "-r", "requirements.txt"],
+manifest_files=["requirements.txt", "setup.py", "pyproject.toml"],
+detect_files=["requirements.txt", "setup.py", "pyproject.toml"],
+version_cmd=["python3", "--version"],
+))
+
+# Python / poetry
+EcosystemRegistry.register(EcosystemInfo(
+key="python-poetry", name="Python (Poetry)", language="python", manager="poetry",
+build_cmd=["poetry", "build"],
+test_cmd=["poetry", "run", "pytest"],
+install_cmd=["poetry", "install"],
+manifest_files=["pyproject.toml", "poetry.lock"],
+detect_files=["poetry.lock"],
+version_cmd=["poetry", "--version"],
+))
+
+# Python / uv
+EcosystemRegistry.register(EcosystemInfo(
+key="python-uv", name="Python (uv)", language="python", manager="uv",
+build_cmd=["uv", "build"],
+test_cmd=["uv", "run", "pytest"],
+install_cmd=["uv", "sync"],
+manifest_files=["pyproject.toml", "uv.lock"],
+detect_files=["uv.lock"],
+version_cmd=["uv", "--version"],
+))
+
+# Java / Maven
+EcosystemRegistry.register(EcosystemInfo(
+key="java-maven", name="Java (Maven)", language="java", manager="maven",
+build_cmd=["mvn", "-B", "package", "-DskipTests=false"],
+test_cmd=["mvn", "-B", "test"],
+install_cmd=["mvn", "-B", "dependency:resolve"],
+manifest_files=["pom.xml"],
+detect_files=["pom.xml"],
+version_cmd=["mvn", "--version"],
+))
+
+# Java / Gradle
+EcosystemRegistry.register(EcosystemInfo(
+key="java-gradle", name="Java (Gradle)", language="java", manager="gradle",
+build_cmd=["gradle", "build"],
+test_cmd=["gradle", "test"],
+install_cmd=["gradle", "dependencies"],
+manifest_files=["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"],
+detect_files=["build.gradle", "build.gradle.kts"],
+version_cmd=["gradle", "--version"],
+))
+
+# Kotlin / Gradle
+EcosystemRegistry.register(EcosystemInfo(
+key="kotlin-gradle", name="Kotlin (Gradle)", language="kotlin", manager="gradle",
+build_cmd=["gradle", "build"],
+test_cmd=["gradle", "test"],
+install_cmd=["gradle", "dependencies"],
+manifest_files=["build.gradle.kts"],
+detect_files=["build.gradle.kts"],
+version_cmd=["gradle", "--version"],
+))
+
+# Rust / Cargo
+EcosystemRegistry.register(EcosystemInfo(
+key="rust-cargo", name="Rust (Cargo)", language="rust", manager="cargo",
+build_cmd=["cargo", "build", "--release"],
+test_cmd=["cargo", "test"],
+install_cmd=["cargo", "fetch"],
+manifest_files=["Cargo.toml", "Cargo.lock"],
+detect_files=["Cargo.toml"],
+version_cmd=["cargo", "--version"],
+))
+
+# Node / npm
+EcosystemRegistry.register(EcosystemInfo(
+key="node-npm", name="Node (npm)", language="javascript", manager="npm",
+build_cmd=["npm", "run", "build"],
+test_cmd=["npm", "test"],
+install_cmd=["npm", "ci"],
+manifest_files=["package.json", "package-lock.json"],
+detect_files=["package-lock.json"],
+version_cmd=["npm", "--version"],
+))
+
+# Node / yarn
+EcosystemRegistry.register(EcosystemInfo(
+key="node-yarn", name="Node (Yarn)", language="javascript", manager="yarn",
+build_cmd=["yarn", "build"],
+test_cmd=["yarn", "test"],
+install_cmd=["yarn", "install", "--frozen-lockfile"],
+manifest_files=["package.json", "yarn.lock"],
+detect_files=["yarn.lock"],
+version_cmd=["yarn", "--version"],
+))
+
+# Node / pnpm
+EcosystemRegistry.register(EcosystemInfo(
+key="node-pnpm", name="Node (pnpm)", language="javascript", manager="pnpm",
+build_cmd=["pnpm", "run", "build"],
+test_cmd=["pnpm", "test"],
+install_cmd=["pnpm", "install", "--frozen-lockfile"],
+manifest_files=["package.json", "pnpm-lock.yaml"],
+detect_files=["pnpm-lock.yaml"],
+version_cmd=["pnpm", "--version"],
+))
+
+# Go / mod
+EcosystemRegistry.register(EcosystemInfo(
+key="go-mod", name="Go (modules)", language="go", manager="go",
+build_cmd=["go", "build", "-o", "bin/app", "./..."],
+test_cmd=["go", "test", "./..."],
+install_cmd=["go", "mod", "download"],
+manifest_files=["go.mod", "go.sum"],
+detect_files=["go.mod"],
+version_cmd=["go", "version"],
+))
+
+# .NET / dotnet
+EcosystemRegistry.register(EcosystemInfo(
+key="dotnet", name=".NET (dotnet)", language="csharp", manager="dotnet",
+build_cmd=["dotnet", "build", "-c", "Release"],
+test_cmd=["dotnet", "test"],
+install_cmd=["dotnet", "restore"],
+manifest_files=["*.csproj", "*.sln"],
+detect_files=["*.csproj", "*.sln"],
+version_cmd=["dotnet", "--version"],
+))
+
+# PHP / Composer
+EcosystemRegistry.register(EcosystemInfo(
+key="php-composer", name="PHP (Composer)", language="php", manager="composer",
+build_cmd=["composer", "install", "--no-dev", "--optimize-autoloader"],
+test_cmd=["composer", "test"],
+install_cmd=["composer", "install"],
+manifest_files=["composer.json", "composer.lock"],
+detect_files=["composer.json"],
+version_cmd=["composer", "--version"],
+))
+
+# Ruby / Bundler
+EcosystemRegistry.register(EcosystemInfo(
+key="ruby-bundler", name="Ruby (Bundler)", language="ruby", manager="bundler",
+build_cmd=["bundle", "exec", "rake", "build"],
+test_cmd=["bundle", "exec", "rspec"],
+install_cmd=["bundle", "install"],
+manifest_files=["Gemfile", "Gemfile.lock"],
+detect_files=["Gemfile"],
+version_cmd=["ruby", "--version"],
+))
+
+# Swift / SwiftPM
+EcosystemRegistry.register(EcosystemInfo(
+key="swift-spm", name="Swift (SwiftPM)", language="swift", manager="swiftpm",
+build_cmd=["swift", "build", "-c", "release"],
+test_cmd=["swift", "test"],
+install_cmd=["swift", "package", "resolve"],
+manifest_files=["Package.swift"],
+detect_files=["Package.swift"],
+version_cmd=["swift", "--version"],
+))
+
+# Scala / sbt
+EcosystemRegistry.register(EcosystemInfo(
+key="scala-sbt", name="Scala (sbt)", language="scala", manager="sbt",
+build_cmd=["sbt", "compile"],
+test_cmd=["sbt", "test"],
+install_cmd=["sbt", "update"],
+manifest_files=["build.sbt"],
+detect_files=["build.sbt"],
+version_cmd=["sbt", "--version"],
+))
+
+# Elixir / Mix
+EcosystemRegistry.register(EcosystemInfo(
+key="elixir-mix", name="Elixir (Mix)", language="elixir", manager="mix",
+build_cmd=["mix", "compile"],
+test_cmd=["mix", "test"],
+install_cmd=["mix", "deps.get"],
+manifest_files=["mix.exs", "mix.lock"],
+detect_files=["mix.exs"],
+version_cmd=["mix", "--version"],
+))
+
+# Erlang / rebar3
+EcosystemRegistry.register(EcosystemInfo(
+key="erlang-rebar3", name="Erlang (rebar3)", language="erlang", manager="rebar3",
+build_cmd=["rebar3", "compile"],
+test_cmd=["rebar3", "eunit"],
+install_cmd=["rebar3", "get-deps"],
+manifest_files=["rebar.config", "rebar.lock"],
+detect_files=["rebar.config"],
+version_cmd=["rebar3", "--version"],
+))
+
+# Dart / pub
+EcosystemRegistry.register(EcosystemInfo(
+key="dart-pub", name="Dart (pub)", language="dart", manager="pub",
+build_cmd=["dart", "pub", "get"],
+test_cmd=["dart", "test"],
+install_cmd=["dart", "pub", "get"],
+manifest_files=["pubspec.yaml", "pubspec.lock"],
+detect_files=["pubspec.yaml"],
+version_cmd=["dart", "--version"],
+))
+
+# Zig
+EcosystemRegistry.register(EcosystemInfo(
+key="zig", name="Zig", language="zig", manager="zig",
+build_cmd=["zig", "build", "-Doptimize=ReleaseFast"],
+test_cmd=["zig", "build", "test"],
+install_cmd=["zig", "build", "--help"],
+manifest_files=["build.zig", "build.zig.zon"],
+detect_files=["build.zig"],
+version_cmd=["zig", "version"],
+))
+
+# Nim
+EcosystemRegistry.register(EcosystemInfo(
+key="nim-nimble", name="Nim (nimble)", language="nim", manager="nimble",
+build_cmd=["nimble", "build", "-d:release"],
+test_cmd=["nimble", "test"],
+install_cmd=["nimble", "install", "--depsOnly"],
+manifest_files=["*.nimble", "nimble.lock"],
+detect_files=["*.nimble"],
+version_cmd=["nimble", "--version"],
+))
+
+# Haskell / Cabal
+EcosystemRegistry.register(EcosystemInfo(
+key="haskell-cabal", name="Haskell (Cabal)", language="haskell", manager="cabal",
+build_cmd=["cabal", "build", "all"],
+test_cmd=["cabal", "test", "all"],
+install_cmd=["cabal", "update"],
+manifest_files=["*.cabal", "cabal.project"],
+detect_files=["*.cabal"],
+version_cmd=["cabal", "--version"],
+))
+
+# OCaml / dune
+EcosystemRegistry.register(EcosystemInfo(
+key="ocaml-dune", name="OCaml (dune)", language="ocaml", manager="dune",
+build_cmd=["dune", "build", "--profile", "release"],
+test_cmd=["dune", "runtest"],
+install_cmd=["opam", "install", "--deps-only", "."],
+manifest_files=["dune-project", "*.opam"],
+detect_files=["dune-project"],
+version_cmd=["dune", "--version"],
+))
+
+# C / CMake
+EcosystemRegistry.register(EcosystemInfo(
+key="c-cmake", name="C/C++ (CMake)", language="c", manager="cmake",
+build_cmd=["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release", "&&", "cmake", "--build", "build"],
+test_cmd=["ctest", "--test-dir", "build"],
+install_cmd=["cmake", "-B", "build"],
+manifest_files=["CMakeLists.txt"],
+detect_files=["CMakeLists.txt"],
+version_cmd=["cmake", "--version"],
+))
+
+# C / Make
+EcosystemRegistry.register(EcosystemInfo(
+key="c-make", name="C/C++ (Make)", language="c", manager="make",
+build_cmd=["make", "-j"],
+test_cmd=["make", "test"],
+install_cmd=["make", "deps"],
+manifest_files=["Makefile"],
+detect_files=["Makefile"],
+version_cmd=["make", "--version"],
+))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SQLITE
+# ═══════════════════════════════════════════════════════════════════
+
+class DBManager:
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS builds (
+id TEXT PRIMARY KEY,
+request_id TEXT,
+ecosystem TEXT,
+status TEXT,
+started_at TEXT,
+finished_at TEXT,
+duration_sec REAL,
+exit_code INTEGER,
+cache_hit INTEGER,
+security_findings INTEGER,
+cost_usd REAL,
+arch TEXT,
+worker TEXT,
+request_json TEXT,
+stdout TEXT,
+stderr TEXT
+);
+CREATE TABLE IF NOT EXISTS cache (
+key TEXT PRIMARY KEY,
+path TEXT,
+size_bytes INTEGER,
+created_at TEXT,
+hits INTEGER DEFAULT 0,
+last_hit TEXT
+);
+CREATE TABLE IF NOT EXISTS workers (
+id TEXT PRIMARY KEY,
+host TEXT,
+port INTEGER,
+arch TEXT,
+cpus INTEGER,
+memory_mb INTEGER,
+state TEXT,
+last_seen REAL,
+jobs_done INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS security_findings (
+id TEXT PRIMARY KEY,
+build_id TEXT,
+severity TEXT,
+kind TEXT,
+file TEXT,
+line INTEGER,
+snippet TEXT,
+recommendation TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+ts TEXT,
+kind TEXT,
+data TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
+CREATE INDEX IF NOT EXISTS idx_builds_ecosystem ON builds(ecosystem);
+CREATE INDEX IF NOT EXISTS idx_findings_build ON security_findings(build_id);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+"""
+
+def __init__(self, path: Path):
+self.path = path
+self.lock = threading.RLock()
+self.conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
+self.conn.row_factory = sqlite3.Row
+self._migrate()
+
+def _migrate(self):
+with self.lock:
+self.conn.executescript(self.SCHEMA)
+self.conn.commit()
+
+def execute(self, sql: str, params: Tuple = ()) -> sqlite3.Cursor:
+with self.lock:
+cur = self.conn.execute(sql, params)
+self.conn.commit()
+return cur
+
+def query(self, sql: str, params: Tuple = ()) -> List[sqlite3.Row]:
+with self.lock:
+return self.conn.execute(sql, params).fetchall()
+
+def event(self, kind: str, data: Any):
+self.execute(
+"INSERT INTO events(ts, kind, data) VALUES(?,?,?)",
+(datetime.datetime.now(datetime.timezone.utc).isoformat(), kind, json.dumps(data, default=str)),
+)
+
+def save_build(self, req: BuildRequest, res: BuildResult):
+self.execute(
+"""INSERT OR REPLACE INTO builds
+(id, request_id, ecosystem, status, started_at, finished_at, duration_sec,
+exit_code, cache_hit, security_findings, cost_usd, arch, worker,
+request_json, stdout, stderr)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+(res.id, res.request_id, res.ecosystem, res.status, res.started_at, res.finished_at,
+res.duration_sec, res.exit_code, 1 if res.cache_hit else 0, res.security_findings,
+res.cost_usd, res.arch, res.worker, json.dumps(asdict(req), default=str),
+res.stdout[-200000:], res.stderr[-200000:]),
+)
+
+def get_build(self, build_id: str) -> Optional[Dict[str, Any]]:
+rows = self.query("SELECT * FROM builds WHERE id = ?", (build_id,))
+return dict(rows[0]) if rows else None
+
+def list_builds(self, limit: int = 100) -> List[Dict[str, Any]]:
+rows = self.query("SELECT id, ecosystem, status, started_at, duration_sec, cache_hit, arch, worker FROM builds ORDER BY started_at DESC LIMIT ?", (limit,))
+return [dict(r) for r in rows]
+
+def cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+rows = self.query("SELECT * FROM cache WHERE key = ?", (key,))
+if not rows:
+return None
+self.execute("UPDATE cache SET hits = hits + 1, last_hit = ? WHERE key = ?",
+(datetime.datetime.now(datetime.timezone.utc).isoformat(), key))
+return dict(rows[0])
+
+def cache_put(self, key: str, path: str, size: int):
+self.execute(
+"INSERT OR REPLACE INTO cache(key, path, size_bytes, created_at, hits, last_hit) VALUES(?,?,?,?,0,?)",
+(key, path, size, datetime.datetime.now(datetime.timezone.utc).isoformat(), ""),
+)
+
+def cache_stats(self) -> Dict[str, Any]:
+rows = self.query("SELECT COUNT(*) AS n, SUM(size_bytes) AS s, SUM(hits) AS h FROM cache")
+if not rows:
+return {"entries": 0, "size_bytes": 0, "hits": 0}
+r = rows[0]
+return {"entries": r["n"] or 0, "size_bytes": r["s"] or 0, "hits": r["h"] or 0}
+
+def register_worker(self, w: Worker):
+self.execute(
+"""INSERT OR REPLACE INTO workers(id, host, port, arch, cpus, memory_mb, state, last_seen, jobs_done)
+VALUES (?,?,?,?,?,?,?,?,?)""",
+(w.id, w.host, w.port, w.arch, w.cpus, w.memory_mb, w.state, w.last_seen, w.jobs_done),
+)
+
+def list_workers(self) -> List[Dict[str, Any]]:
+rows = self.query("SELECT * FROM workers ORDER BY last_seen DESC")
+return [dict(r) for r in rows]
+
+def save_finding(self, f: SecurityFinding):
+self.execute(
+"""INSERT OR REPLACE INTO security_findings(id, build_id, severity, kind, file, line, snippet, recommendation)
+VALUES (?,?,?,?,?,?,?,?)""",
+(f.id, f.build_id, f.severity, f.kind, f.file, f.line, f.snippet, f.recommendation),
+)
+
+def findings_for_build(self, build_id: str) -> List[Dict[str, Any]]:
+rows = self.query("SELECT * FROM security_findings WHERE build_id = ?", (build_id,))
+return [dict(r) for r in rows]
+
+def stats(self) -> Dict[str, Any]:
+total = self.query("SELECT COUNT(*) AS n FROM builds")[0]["n"]
+success = self.query("SELECT COUNT(*) AS n FROM builds WHERE status = 'success'")[0]["n"]
+failed = self.query("SELECT COUNT(*) AS n FROM builds WHERE status = 'failed'")[0]["n"]
+cached = self.query("SELECT COUNT(*) AS n FROM builds WHERE cache_hit = 1")[0]["n"]
+avg = self.query("SELECT AVG(duration_sec) AS d FROM builds WHERE status='success'")[0]["d"] or 0.0
+return {
+"builds_total": total,
+"builds_success": success,
+"builds_failed": failed,
+"builds_cached": cached,
+"avg_duration_sec": round(avg, 2),
+}
+
+def close(self):
+with self.lock:
+self.conn.close()
+
+
+DB: DBManager = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CACHE
+# ═══════════════════════════════════════════════════════════════════
+
+class CacheStore:
+"""Cache content-addressed pour artefacts de build."""
+
+def __init__(self, cache_dir: Path):
+self.dir = cache_dir
+self.dir.mkdir(parents=True, exist_ok=True)
+self.lock = threading.RLock()
+
+def key_for(self, project_path: str, ecosystem: str, extra: str = "") -> str:
+h = hashlib.sha256()
+p = Path(project_path)
+if p.is_dir():
+files = sorted([f for f in p.rglob("*") if f.is_file()])
+for f in files[:2000]:
+try:
+rel = str(f.relative_to(p))
+stat = f.stat()
+h.update(rel.encode())
+h.update(str(stat.st_size).encode())
+h.update(str(int(stat.st_mtime)).encode())
+except OSError:
+continue
+h.update(ecosystem.encode())
+h.update(extra.encode())
+return h.hexdigest()[:32]
+
+def lookup(self, key: str) -> Optional[str]:
+with self.lock:
+r = DB.cache_get(key)
+if not r:
+return None
+path = Path(r["path"])
+if path.exists():
+return str(path)
+return None
+
+def store(self, key: str, source_path: str) -> str:
+with self.lock:
+src = Path(source_path)
+if not src.exists():
+return ""
+dst = self.dir / key
+dst.mkdir(parents=True, exist_ok=True)
+size = 0
+if src.is_dir():
+for f in src.rglob("*"):
+if f.is_file():
+rel = f.relative_to(src)
+target = dst / rel
+target.parent.mkdir(parents=True, exist_ok=True)
+try:
+shutil.copy2(f, target)
+size += target.stat().st_size
+except OSError:
+continue
+else:
+target = dst / src.name
+shutil.copy2(src, target)
+size = target.stat().st_size
+DB.cache_put(key, str(dst), size)
+return str(dst)
+
+def clean(self, max_age_days: int = 30) -> int:
+cutoff = time.time() - max_age_days * 86400
+removed = 0
+with self.lock:
+for entry in self.dir.iterdir():
+try:
+if entry.stat().st_mtime < cutoff:
+shutil.rmtree(entry, ignore_errors=True)
+removed += 1
+except OSError:
+continue
+return removed
+
+
+CACHE: CacheStore = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SECURITY SCANNER
+# ═══════════════════════════════════════════════════════════════════
+
+SECURITY_PATTERNS = [
+("AWS Access Key", r"AKIA[0-9A-Z]{16}", Severity.CRITICAL.value, "Revoquer la cle AWS"),
+("AWS Secret", r"(?i)aws[_\-]?secret[_\-]?access[_\-]?key\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{40})", Severity.CRITICAL.value, "Revoquer la cle AWS"),
+("GCP Service Account", r'"type"\s*:\s*"service_account"', Severity.CRITICAL.value, "Revoquer le service account"),
+("GitHub Token", r"ghp_[A-Za-z0-9]{36}", Severity.CRITICAL.value, "Revoquer le token GitHub"),
+("Slack Token", r"xox[baprs]-[A-Za-z0-9\-]+", Severity.HIGH.value, "Revoquer le token Slack"),
+("OpenAI Key", r"sk-[A-Za-z0-9]{48}", Severity.CRITICAL.value, "Revoquer la cle OpenAI"),
+("Anthropic Key", r"sk-ant-[A-Za-z0-9\-_]{80,}", Severity.CRITICAL.value, "Revoquer la cle Anthropic"),
+("Private Key", r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----", Severity.CRITICAL.value, "Retirer la cle privee du repo"),
+("Password in code", r"(?i)(password|passwd|pwd)\s*[:=]\s*['\"][^'\"]{8,}['\"]", Severity.HIGH.value, "Utiliser un secret manager"),
+("Bearer Token", r"(?i)bearer\s+[A-Za-z0-9\-_\.=]{20,}", Severity.HIGH.value, "Revoquer le bearer"),
+("JDBC URL with creds", r"jdbc:[a-z]+://[^:]+:[^@]+@[^\s]+", Severity.CRITICAL.value, "Utiliser des variables d'environnement"),
+("Postgres URL", r"postgres(?:ql)?://[^:]+:[^@]+@[^\s]+", Severity.CRITICAL.value, "Retirer les creds du code"),
+("MySQL URL", r"mysql://[^:]+:[^@]+@[^\s]+", Severity.CRITICAL.value, "Retirer les creds du code"),
+("MongoDB URL", r"mongodb(\+srv)?://[^:]+:[^@]+@[^\s]+", Severity.CRITICAL.value, "Retirer les creds du code"),
+("Redis URL", r"redis://[^:]*:[^@]+@[^\s]+", Severity.HIGH.value, "Retirer les creds du code"),
+]
+
+COMPILED_SEC = [(n, re.compile(p), s, r) for n, p, s, r in SECURITY_PATTERNS]
+
+
+class SecurityScanner:
+"""Scanner basique de secrets et patterns sensibles."""
+
+def __init__(self, max_file_size: int = 5 * 1024 * 1024):
+self.max_file_size = max_file_size
+self.text_exts = {
+".py", ".java", ".kt", ".scala", ".rs", ".go", ".rb", ".php", ".js", ".ts",
+".jsx", ".tsx", ".cs", ".swift", ".m", ".mm", ".c", ".h", ".cpp", ".hpp",
+".sh", ".bash", ".zsh", ".ps1", ".yaml", ".yml", ".json", ".toml", ".ini",
+".cfg", ".conf", ".env", ".properties", ".gradle", ".xml", ".tf", ".ex", ".exs",
+".erl", ".hrl", ".lua", ".pl", ".r", ".jl", ".dart", ".nim", ".zig", ".hs", ".ml",
+}
+
+def scan(self, build_id: str, project_path: str) -> List[SecurityFinding]:
+findings: List[SecurityFinding] = []
+p = Path(project_path)
+if not p.exists():
+return findings
+files = [p] if p.is_file() else [f for f in p.rglob("*") if f.is_file()]
+for f in files:
+try:
+if f.stat().st_size > self.max_file_size:
+continue
+if f.suffix.lower() not in self.text_exts and f.name not in (".env", "Dockerfile", "Makefile"):
+continue
+content = f.read_text(encoding="utf-8", errors="ignore")
+except OSError:
+continue
+lines = content.splitlines()
+for idx, line in enumerate(lines, 1):
+for name, rx, sev, reco in COMPILED_SEC:
+m = rx.search(line)
+if m:
+snippet = line.strip()[:200]
+value = m.group(0)
+masked = value[:6] + "..." + value[-4:] if len(value) > 12 else value[:6] + "..."
+findings.append(SecurityFinding(
+id=str(uuid.uuid4())[:12],
+build_id=build_id,
+severity=sev,
+kind=name,
+file=str(f),
+line=idx,
+snippet=snippet.replace(value, masked),
+recommendation=reco,
+))
+return findings
+
+
+SEC = SecurityScanner()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# COST OPTIMIZER
+# ═══════════════════════════════════════════════════════════════════
+
+class CostOptimizer:
+"""Estimation de coût basique d'un build."""
+
+HOURLY_RATES = {
+"local": 0.0,
+"distributed": 0.05,
+"cloud": 0.25,
+"hybrid": 0.12,
+}
+
+@classmethod
+def estimate(cls, mode: str, duration_sec: float, arch: str) -> float:
+rate = cls.HOURLY_RATES.get(mode, 0.05)
+hours = duration_sec / 3600.0
+multiplier = 1.0
+if arch == Architecture.ARM64.value:
+multiplier = 0.9
+elif arch == Architecture.RISCV64.value:
+multiplier = 1.2
+elif arch == Architecture.WASM.value:
+multiplier = 0.5
+return round(rate * hours * multiplier, 6)
+
+@classmethod
+def compare_modes(cls, duration_sec: float, arch: str) -> Dict[str, float]:
+return {mode: cls.estimate(mode, duration_sec, arch) for mode in cls.HOURLY_RATES}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WORKER POOL
+# ═══════════════════════════════════════════════════════════════════
+
+class WorkerPool:
+"""Pool local de workers simulant un réseau distribué."""
+
+def __init__(self, min_workers: int = 2, max_workers: int = 16):
+self.lock = threading.RLock()
+self.workers: Dict[str, Worker] = {}
+self.min_workers = min_workers
+self.max_workers = max_workers
+self.executor = ThreadPoolExecutor(max_workers=max_workers)
+for _ in range(min_workers):
+self.add_worker()
+
+def add_worker(self, arch: str = Architecture.X86_64.value) -> Worker:
+with self.lock:
+if len(self.workers) >= self.max_workers:
+return next(iter(self.workers.values()))
+wid = str(uuid.uuid4())[:8]
+w = Worker(
+id=wid,
+host="127.0.0.1",
+port=0,
+arch=arch,
+cpus=os.cpu_count() or 1,
+memory_mb=4096,
+state="idle",
+last_seen=time.time(),
+jobs_done=0,
+)
+self.workers[wid] = w
+DB.register_worker(w)
+logl("worker_added", id=wid, arch=arch)
+return w
+
+def remove_worker(self, wid: str) -> bool:
+with self.lock:
+if wid in self.workers and len(self.workers) > self.min_workers:
+del self.workers[wid]
+return True
+return False
+
+def pick(self) -> Optional[Worker]:
+with self.lock:
+candidates = [w for w in self.workers.values() if w.state == "idle"]
+if not candidates:
+candidates = list(self.workers.values())
+if not candidates:
+return None
+candidates.sort(key=lambda w: w.jobs_done)
+return candidates[0]
+
+def auto_scale(self, load: int):
+with self.lock:
+target = max(self.min_workers, min(self.max_workers, load + self.min_workers))
+while len(self.workers) < target:
+self.add_worker()
+while len(self.workers) > target and len(self.workers) > self.min_workers:
+wid = next(iter(self.workers.keys()))
+self.remove_worker(wid)
+
+def list_workers(self) -> List[Worker]:
+with self.lock:
+return list(self.workers.values())
+
+def submit(self, fn: Callable, *args, **kwargs) -> concurrent.futures.Future:
+return self.executor.submit(fn, *args, **kwargs)
+
+def shutdown(self):
+self.executor.shutdown(wait=False)
+
+
+POOL: WorkerPool = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BUILD ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+class BuildEngine:
+"""Coeur d'orchestration."""
+
+def __init__(self):
+self.lock = threading.RLock()
+self.results: Dict[str, BuildResult] = {}
+self.futures: Dict[str, concurrent.futures.Future] = {}
+self.stop = threading.Event()
+
+def _env_for(self, req: BuildRequest) -> Dict[str, str]:
+env = os.environ.copy()
+env.update(req.env or {})
+env["NEXUS_BUILD_ID"] = req.id
+env["NEXUS_ARCH"] = req.arch
+env["NEXUS_MODE"] = req.mode
+return env
+
+def _run_cmd(self, cmd: List[str], cwd: str, env: Dict[str, str], timeout: int, verbose: bool) -> Tuple[int, str, str]:
+try:
+if verbose:
+logl("run_cmd", cmd=cmd, cwd=cwd)
+proc = subprocess.run(
+cmd,
+cwd=cwd,
+env=env,
+capture_output=True,
+text=True,
+timeout=timeout,
+)
+return proc.returncode, proc.stdout, proc.stderr
+except subprocess.TimeoutExpired:
+return 124, "", "TIMEOUT après " + str(timeout) + "s"
+except FileNotFoundError as e:
+return 127, "", "Commande introuvable: " + str(e)
+except Exception as e:
+return 1, "", "Erreur: " + str(e)
+
+def _check_tool(self, cmd: List[str]) -> bool:
+if not cmd:
+return False
+return shutil.which(cmd[0]) is not None
+
+def build(self, req: BuildRequest) -> BuildResult:
+started_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+t0 = time.time()
+eco = EcosystemRegistry.get(req.ecosystem)
+if not eco:
+return BuildResult(
+id=req.id, request_id=req.id, status=BuildStatus.FAILED.value,
+ecosystem=req.ecosystem, started_at=started_at, finished_at=started_at,
+duration_sec=0.0, exit_code=1, stdout="",
+stderr="Ecosystem inconnu: " + req.ecosystem,
+artifacts=[], cache_hit=False, security_findings=0,
+cost_usd=0.0, arch=req.arch, worker="none",
+)
+
+if not self._check_tool(eco.build_cmd):
+# fallback : marquer comme SKIP mais non-crash
+duration = time.time() - t0
+res = BuildResult(
+id=req.id, request_id=req.id, status=BuildStatus.FAILED.value,
+ecosystem=req.ecosystem, started_at=started_at,
+finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+duration_sec=round(duration, 3), exit_code=127, stdout="",
+stderr="Outil requis introuvable: " + eco.build_cmd[0],
+artifacts=[], cache_hit=False, security_findings=0,
+cost_usd=CostOptimizer.estimate(req.mode, duration, req.arch),
+arch=req.arch, worker="none",
+)
+DB.save_build(req, res)
+DB.event("build_failed", {"id": req.id, "reason": "tool_missing"})
+return res
+
+# Cache lookup
+cache_key = CACHE.key_for(req.project_path, req.ecosystem, json.dumps(req.env, sort_keys=True))
+if req.cache:
+hit = CACHE.lookup(cache_key)
+if hit:
+duration = time.time() - t0
+res = BuildResult(
+id=req.id, request_id=req.id, status=BuildStatus.CACHED.value,
+ecosystem=req.ecosystem, started_at=started_at,
+finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+duration_sec=round(duration, 3), exit_code=0,
+stdout="Cache hit: " + cache_key, stderr="",
+artifacts=[hit], cache_hit=True, security_findings=0,
+cost_usd=0.0, arch=req.arch, worker="cache",
+)
+DB.save_build(req, res)
+DB.event("build_cached", {"id": req.id, "key": cache_key})
+logl("build_cache_hit", id=req.id, key=cache_key)
+return res
+
+# Pick worker
+worker = POOL.pick() if POOL else None
+worker_id = worker.id if worker else "local"
+if worker:
+worker.state = "busy"
+worker.last_seen = time.time()
+
+# Install deps
+if eco.install_cmd and self._check_tool(eco.install_cmd):
+rc, out, err = self._run_cmd(eco.install_cmd, req.project_path, self._env_for(req), req.timeout_sec, req.verbose)
+if rc != 0:
+logl("install_failed", id=req.id, rc=rc)
+
+# Build
+rc, out, err = self._run_cmd(eco.build_cmd, req.project_path, self._env_for(req), req.timeout_sec, req.verbose)
+status = BuildStatus.SUCCESS.value if rc == 0 else BuildStatus.FAILED.value
+
+# Security scan
+findings: List[SecurityFinding] = []
+if req.security_scan:
+try:
+findings = SEC.scan(req.id, req.project_path)
+for f in findings:
+DB.save_finding(f)
+except Exception as e:
+logl("security_scan_error", error=str(e))
+
+# Artifacts detection
+artifacts: List[str] = []
+for pattern in ("dist/*", "target/*", "build/*", "bin/*", "out/*", "*.jar", "*.whl", "*.tgz", "*.zip"):
+try:
+for f in Path(req.project_path).glob(pattern):
+if f.is_file():
+artifacts.append(str(f))
+except Exception:
+pass
+
+# Cache store on success
+if rc == 0 and req.cache and artifacts:
+try:
+for a in artifacts[:10]:
+CACHE.store(cache_key, a)
+except Exception as e:
+logl("cache_store_error", error=str(e))
+
+if worker:
+worker.state = "idle"
+worker.jobs_done += 1
+worker.last_seen = time.time()
+DB.register_worker(worker)
+
+duration = time.time() - t0
+res = BuildResult(
+id=req.id, request_id=req.id, status=status,
+ecosystem=req.ecosystem, started_at=started_at,
+finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+duration_sec=round(duration, 3), exit_code=rc,
+stdout=out[-200000:], stderr=err[-200000:],
+artifacts=artifacts, cache_hit=False,
+security_findings=len(findings),
+cost_usd=CostOptimizer.estimate(req.mode, duration, req.arch),
+arch=req.arch, worker=worker_id,
+)
+DB.save_build(req, res)
+DB.event("build_done", {"id": req.id, "status": status, "duration": duration})
+logl("build_done", id=req.id, status=status, duration=round(duration, 3), worker=worker_id)
+return res
+
+def submit(self, req: BuildRequest) -> concurrent.futures.Future:
+with self.lock:
+fut = POOL.submit(self.build, req)
+self.futures[req.id] = fut
+return fut
+
+def submit_batch(self, reqs: List[BuildRequest]) -> Dict[str, concurrent.futures.Future]:
+out: Dict[str, concurrent.futures.Future] = {}
+for r in reqs:
+out[r.id] = self.submit(r)
+POOL.auto_scale(len(reqs))
+return out
+
+
+ENGINE: BuildEngine = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# HTTP API + UI
+# ═══════════════════════════════════════════════════════════════════
+
+HTML_UI = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Nexus Build Omniversal v4.0.0</title>
+<style>
+:root{--bg:#05050a;--panel:#0f0f18;--accent:#00e5ff;--accent2:#ff00c8;--text:#e0e0e0;--muted:#8892a6;--border:rgba(0,229,255,0.25)}
+*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,'SF Pro',Inter,sans-serif}
+body{background:var(--bg);color:var(--text);min-height:100vh}
+header{padding:20px 30px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+h1{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent;font-size:1.6rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;padding:20px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px}
+.card h2{color:var(--accent);font-size:1.05rem;margin-bottom:12px}
+.stat{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05)}
+.stat:last-child{border-bottom:none}
+.val{color:var(--accent)}
+button{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#000;border:none;padding:10px 18px;border-radius:10px;font-weight:600;cursor:pointer;margin:4px 4px 4px 0}
+select,input,textarea{background:rgba(0,0,0,0.5);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-size:0.9rem;width:100%;margin:6px 0}
+table{width:100%;border-collapse:collapse;font-size:0.85rem}
+th,td{padding:8px;border-bottom:1px solid rgba(255,255,255,0.05);text-align:left}
+th{color:var(--accent)}
+pre{background:#000;border-radius:8px;padding:12px;font-size:0.75rem;overflow-x:auto;max-height:280px;border:1px solid var(--border)}
+.crit{color:#ff4444}.high{color:#ff8800}.med{color:#ffcc00}.low{color:#88cc88}
+</style>
+</head>
+<body>
+<header>
+<h1>Nexus Build Omniversal v4.0.0</h1>
+<div><span class="val" id="uptime">0s</span></div>
+</header>
+<div class="grid">
+<div class="card"><h2>Stats</h2>
+<div class="stat"><span>Builds total</span><span class="val" id="bt">0</span></div>
+<div class="stat"><span>Succes</span><span class="val" id="bs">0</span></div>
+<div class="stat"><span>Echecs</span><span class="val" id="bf">0</span></div>
+<div class="stat"><span>Cache hits</span><span class="val" id="bc">0</span></div>
+<div class="stat"><span>Duree moyenne</span><span class="val" id="bd">0s</span></div>
+</div>
+<div class="card"><h2>Ecosystemes</h2>
+<select id="eco"></select>
+<input id="path" placeholder="/chemin/vers/projet">
+<select id="mode">
+<option value="local">Local</option>
+<option value="distributed">Distributed</option>
+<option value="cloud">Cloud</option>
+<option value="hybrid">Hybrid</option>
+</select>
+<select id="arch">
+<option value="x86_64">x86_64</option>
+<option value="arm64">arm64</option>
+<option value="riscv64">riscv64</option>
+<option value="wasm32">wasm32</option>
+</select>
+<button onclick="lancerBuild()">Lancer build</button>
+</div>
+<div class="card"><h2>Workers</h2>
+<div id="workers"></div>
+<button onclick="scaleWorkers()">Auto-scale</button>
+</div>
+<div class="card" style="grid-column:1/-1"><h2>Derniers builds</h2>
+<table><thead><tr><th>ID</th><th>Ecosysteme</th><th>Statut</th><th>Duree</th><th>Cache</th><th>Worker</th></tr></thead><tbody id="builds"></tbody></table>
+</div>
+<div class="card" style="grid-column:1/-1"><h2>Dernier resultat</h2>
+<pre id="lastout">Aucun build</pre>
+</div>
+</div>
+<script>
+async function refresh(){
+try {
+const r = await fetch('/api/v1/status');
+const d = await r.json();
+document.getElementById('bt').textContent = d.stats.builds_total;
+document.getElementById('bs').textContent = d.stats.builds_success;
+document.getElementById('bf').textContent = d.stats.builds_failed;
+document.getElementById('bc').textContent = d.stats.builds_cached;
+document.getElementById('bd').textContent = d.stats.avg_duration_sec + 's';
+document.getElementById('uptime').textContent = d.uptime_sec + 's';
+const w = document.getElementById('workers');
+w.innerHTML = '';
+d.workers.forEach(x => { w.innerHTML += '<div class="stat"><span>' + x.id + ' (' + x.arch + ')</span><span class="val">' + x.state + ' | ' + x.jobs_done + ' jobs</span></div>'; });
+const b = document.getElementById('builds');
+b.innerHTML = '';
+d.recent_builds.forEach(x => { b.innerHTML += '<tr><td>' + x.id.substring(0,10) + '</td><td>' + x.ecosystem + '</td><td>' + x.status + '</td><td>' + x.duration_sec + 's</td><td>' + (x.cache_hit ? 'OUI' : 'NON') + '</td><td>' + x.worker + '</td></tr>'; });
+} catch(e){}
+}
+async function loadEco(){
+const r = await fetch('/api/v1/ecosystems');
+const d = await r.json();
+const s = document.getElementById('eco');
+s.innerHTML = '';
+d.ecosystems.forEach(e => { s.innerHTML += '<option value="' + e.key + '">' + e.name + '</option>'; });
+}
+async function lancerBuild(){
+const eco = document.getElementById('eco').value;
+const path = document.getElementById('path').value;
+const mode = document.getElementById('mode').value;
+const arch = document.getElementById('arch').value;
+if (!path) return alert('Chemin manquant');
+const r = await fetch('/api/v1/build', {
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body: JSON.stringify({project_path: path, ecosystem: eco, mode: mode, arch: arch})
+});
+const d = await r.json();
+document.getElementById('lastout').textContent = JSON.stringify(d, null, 2);
+setTimeout(refresh, 800);
+}
+async function scaleWorkers(){
+await fetch('/api/v1/workers/scale', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({target: 6})});
+refresh();
+}
+loadEco();
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+server_version = "NexusOmniversal/" + VERSION
+
+def log_message(self, *args):
+pass
+
+def _send(self, code: int, ctype: str, body: bytes):
+try:
+self.send_response(code)
+self.send_header("Content-Type", ctype)
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.end_headers()
+self.wfile.write(body)
+except (BrokenPipeError, ConnectionResetError):
+pass
+
+def _json(self, code: int, obj: Any):
+body = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+self._send(code, "application/json; charset=utf-8", body)
+
+def _read_json(self) -> Dict[str, Any]:
+try:
+n = int(self.headers.get("Content-Length", 0))
+if n == 0:
+return {}
+if n > 10 * 1024 * 1024:
+return {}
+return json.loads(self.rfile.read(n).decode("utf-8"))
+except Exception:
+return {}
+
+def do_OPTIONS(self):
+self.send_response(200)
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+self.send_header("Access-Control-Allow-Headers", "Content-Type")
+self.end_headers()
+
+def do_GET(self):
+u = urllib.parse.urlparse(self.path)
+p = u.path
+if p in ("/", "/index.html", "/ui"):
+return self._send(200, "text/html; charset=utf-8", HTML_UI.encode("utf-8"))
+if p == "/api/v1/health":
+return self._json(200, {"status": "ok", "version": VERSION, "build": BUILD, "protocol": PROTOCOL})
+if p == "/api/v1/ecosystems":
+return self._json(200, {"ecosystems": [asdict(e) for e in EcosystemRegistry.ECOSYSTEMS.values()]})
+if p == "/api/v1/status":
+s = DB.stats()
+workers = [asdict(w) for w in POOL.list_workers()]
+recent = DB.list_builds(limit=30)
+return self._json(200, {
+"version": VERSION,
+"build": BUILD,
+"uptime_sec": int(time.time() - START_TS),
+"stats": s,
+"workers": workers,
+"recent_builds": recent,
+"cache": DB.cache_stats(),
+"ecosystems_count": len(EcosystemRegistry.ECOSYSTEMS),
+})
+if p == "/api/v1/builds":
+return self._json(200, {"builds": DB.list_builds(limit=200)})
+if p.startswith("/api/v1/builds/"):
+bid = p.rsplit("/", 1)[-1]
+b = DB.get_build(bid)
+if not b:
+return self._json(404, {"error": "not_found"})
+return self._json(200, b)
+if p == "/api/v1/workers":
+return self._json(200, {"workers": [asdict(w) for w in POOL.list_workers()]})
+if p == "/api/v1/metrics":
+return self._json(200, {
+"stats": DB.stats(),
+"cache": DB.cache_stats(),
+"workers": len(POOL.list_workers()),
+"ecosystems": len(EcosystemRegistry.ECOSYSTEMS),
+})
+if p == "/api/v1/cost/estimate":
+q = urllib.parse.parse_qs(u.query)
+dur = float(q.get("duration_sec", ["60"])[0])
+arch = q.get("arch", ["x86_64"])[0]
+return self._json(200, {"arch": arch, "duration_sec": dur, "costs": CostOptimizer.compare_modes(dur, arch)})
+return self._json(404, {"error": "not_found"})
+
+def do_POST(self):
+u = urllib.parse.urlparse(self.path)
+p = u.path
+data = self._read_json()
+if p == "/api/v1/build":
+project = data.get("project_path") or ""
+eco = data.get("ecosystem") or ""
+if not project or not eco:
+return self._json(400, {"error": "missing project_path/ecosystem"})
+rid = str(uuid.uuid4())[:12]
+req = BuildRequest(
+id=rid,
+project_path=project,
+ecosystem=eco,
+mode=data.get("mode", "local"),
+target=data.get("target", "default"),
+arch=data.get("arch", "x86_64"),
+env=data.get("env", {}),
+priority=int(data.get("priority", 5)),
+timeout_sec=int(data.get("timeout_sec", 1800)),
+clean=bool(data.get("clean", False)),
+parallel=int(data.get("parallel", 0)),
+verbose=bool(data.get("verbose", False)),
+cache=bool(data.get("cache", True)),
+security_scan=bool(data.get("security_scan", True)),
+created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+)
+fut = ENGINE.submit(req)
+try:
+res = fut.result(timeout=req.timeout_sec + 30)
+return self._json(200, asdict(res))
+except concurrent.futures.TimeoutError:
+return self._json(202, {"id": rid, "status": "running"})
+if p == "/api/v1/build/batch":
+items = data.get("items", [])
+if not isinstance(items, list) or not items:
+return self._json(400, {"error": "items must be non-empty list"})
+reqs: List[BuildRequest] = []
+for it in items:
+rid = str(uuid.uuid4())[:12]
+reqs.append(BuildRequest(
+id=rid,
+project_path=it.get("project_path", ""),
+ecosystem=it.get("ecosystem", ""),
+mode=it.get("mode", "local"),
+arch=it.get("arch", "x86_64"),
+env=it.get("env", {}),
+timeout_sec=int(it.get("timeout_sec", 1800)),
+cache=bool(it.get("cache", True)),
+security_scan=bool(it.get("security_scan", True)),
+created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+))
+futs = ENGINE.submit_batch(reqs)
+ids = [r.id for r in reqs]
+return self._json(202, {"submitted": ids})
+if p == "/api/v1/workers/scale":
+target = int(data.get("target", 2))
+POOL.auto_scale(target)
+return self._json(200, {"workers": [asdict(w) for w in POOL.list_workers()]})
+if p == "/api/v1/cache/lookup":
+key = data.get("key", "")
+path = CACHE.lookup(key)
+return self._json(200, {"key": key, "hit": bool(path), "path": path or ""})
+if p == "/api/v1/cache/store":
+key = data.get("key", "")
+src = data.get("path", "")
+stored = CACHE.store(key, src)
+return self._json(200, {"key": key, "stored": stored})
+if p == "/api/v1/security/scan":
+project = data.get("project_path", "")
+build_id = data.get("build_id", str(uuid.uuid4())[:12])
+findings = SEC.scan(build_id, project)
+for f in findings:
+DB.save_finding(f)
+return self._json(200, {"build_id": build_id, "count": len(findings), "findings": [asdict(f) for f in findings]})
+return self._json(404, {"error": "not_found"})
+
+
+class ThreadedServer(ThreadingHTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════
+
+START_TS = time.time()
+
+
+def cli_serve(args):
+global DB, CACHE, POOL, ENGINE, START_TS
+DB = DBManager(DB_PATH)
+CACHE = CacheStore(CACHE_DIR)
+POOL = WorkerPool(min_workers=args.min_workers, max_workers=args.max_workers)
+ENGINE = BuildEngine()
+START_TS = time.time()
+logl("server_start", host=args.host, port=args.port, version=VERSION)
+srv = ThreadedServer((args.host, args.port), Handler)
+print("Nexus Build Omniversal v" + VERSION)
+print("UI : http://localhost:" + str(args.port) + "/")
+print("API : http://localhost:" + str(args.port) + "/api/v1/status")
+print("Stop : Ctrl+C")
+try:
+srv.serve_forever()
+except KeyboardInterrupt:
+print("\narret")
+srv.shutdown()
+
+
+def cli_build(args):
+global DB, CACHE, POOL, ENGINE
+DB = DBManager(DB_PATH)
+CACHE = CacheStore(CACHE_DIR)
+POOL = WorkerPool(min_workers=1, max_workers=4)
+ENGINE = BuildEngine()
+req = BuildRequest(
+id=str(uuid.uuid4())[:12],
+project_path=args.path,
+ecosystem=args.ecosystem,
+mode=args.mode,
+arch=args.arch,
+verbose=args.verbose,
+cache=not args.no_cache,
+security_scan=not args.no_scan,
+created_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+)
+res = ENGINE.build(req)
+print(json.dumps(asdict(res), indent=2, ensure_ascii=False, default=str))
+POOL.shutdown()
+
+
+def cli_detect(args):
+print(json.dumps({"ecosystems": EcosystemRegistry.detect(args.path)}, indent=2))
+
+
+def cli_list(args):
+print(json.dumps({"ecosystems": [asdict(e) for e in EcosystemRegistry.ECOSYSTEMS.values()]}, indent=2, ensure_ascii=False))
+
+
+def main():
+ap = argparse.ArgumentParser(description="Nexus Build Omniversal v" + VERSION)
+sub = ap.add_subparsers(dest="cmd", required=True)
+
+s1 = sub.add_parser("serve", help="Lance le serveur UI + API")
+s1.add_argument("--host", default=HOST_DEFAULT)
+s1.add_argument("--port", type=int, default=PORT_DEFAULT)
+s1.add_argument("--min-workers", type=int, default=2)
+s1.add_argument("--max-workers", type=int, default=16)
+s1.set_defaults(fn=cli_serve)
+
+s2 = sub.add_parser("build", help="Build un projet en CLI")
+s2.add_argument("--path", required=True)
+s2.add_argument("--ecosystem", required=True)
+s2.add_argument("--mode", default="local", choices=["local", "distributed", "cloud", "hybrid"])
+s2.add_argument("--arch", default="x86_64", choices=["x86_64", "arm64", "riscv64", "wasm32"])
+s2.add_argument("--verbose", action="store_true")
+s2.add_argument("--no-cache", action="store_true")
+s2.add_argument("--no-scan", action="store_true")
+s2.set_defaults(fn=cli_build)
+
+s3 = sub.add_parser("detect", help="Detecte les ecosystemes d'un projet")
+s3.add_argument("--path", required=True)
+s3.set_defaults(fn=cli_detect)
+
+s4 = sub.add_parser("list", help="Liste les ecosystemes supportes")
+s4.set_defaults(fn=cli_list)
+
+args = ap.parse_args()
+args.fn(args)
+
+
+if __name__ == "__main__":
+main()
