@@ -1,0 +1,52 @@
+# AVANT : Imports dispersés, valeurs magiques partout
+# APRÈS : Groupement logique + configuration externalisée
+
+import sys
+if sys.version_info < (3, 9):
+    raise RuntimeError("Python 3.9+ requis")
+
+# ===== CONFIGURATION CENTRALISÉE =====
+class Config:
+    """Toutes les constantes sont ici — changement centralisé possible."""
+    
+    # Paths
+    ROOT = Path.home() / "nexus_build_omniversal"
+    LOG_DIR = ROOT / "logs"
+    CACHE_DIR = ROOT / "cache"
+    BUILDS_DIR = ROOT / "builds"
+    ARTIFACTS_DIR = ROOT / "artifacts"
+    DB_PATH = ROOT / "omniversal.db"
+    LOG_PATH = LOG_DIR / "engine.log"
+    
+    # Serveur
+    PORT_DEFAULT = 9090
+    HOST_DEFAULT = "0.0.0.0"
+    MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB
+    
+    # Build
+    TIMEOUT_DEFAULT = 1800  # seconds
+    MAX_WORKERS_MIN = 2
+    MAX_WORKERS_MAX = 16
+    STDOUT_TRUNCATE = 200000
+    MAX_FILE_SIZE_SCAN = 5 * 1024 * 1024  # 5MB
+    MAX_CACHE_ENTRIES = 1000
+    
+    # Cache
+    CACHE_TTL_DAYS = 30
+    CACHE_HASH_FILES_LIMIT = 2000
+    CACHE_CLEAN_INTERVAL = 3600  # seconds
+    
+    # Security
+    SECURITY_SCANNER_EXTS = frozenset({
+        ".py", ".java", ".kt", ".scala", ".rs", ".go", ".rb", ".php",
+        ".js", ".ts", ".jsx", ".tsx", ".cs", ".swift", ".c", ".h",
+        ".cpp", ".hpp", ".sh", ".bash", ".zsh", ".yaml", ".yml",
+        ".json", ".toml", ".ini", ".cfg", ".conf", ".env",
+        ".properties", ".gradle", ".xml", ".tf", ".ex", ".exs",
+        ".erl", ".hrl", ".lua", ".pl", ".r", ".jl", ".dart",
+        ".nim", ".zig", ".hs", ".ml"
+    })
+    
+    # Logging
+    LOG_FORMAT = '{"ts":"%(asctime)s","lvl":"%(levelname)s","msg":"%(message)s"}'
+    LOG_LEVEL = logging.INFO
